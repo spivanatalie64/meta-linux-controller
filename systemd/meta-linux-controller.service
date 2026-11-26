@@ -1,0 +1,17 @@
+[Unit]
+Description=Meta Linux Controller -- Muse control daemon for Natalie's PC
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 %h/meta-linux-controller/meta_linux_controllerd.py
+WorkingDirectory=%h/meta-linux-controller
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/run/user/1000/gdm/Xauthority
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
+Environment=MLC_PORT=8771
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
