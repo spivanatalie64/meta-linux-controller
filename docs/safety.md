@@ -33,13 +33,36 @@ Muse VM is worthless the moment the PC's token changes.
 ## Hard lines in the code
 
 - **Token required.** Every endpoint, including `/ping`, answers 401
-  without the token. The daemon refuses to start with no token.
+  without a token.
+- **Two token scopes (v1.1, #11).** The *read* token can look:
+  status, screenshots, tree, windows, the chat queues, the audit
+  log. The *full* token can act, and can do everything read can.
+  A read token reaching for an act verb gets a 403 that names the
+  scope it needs. Tokens rotate on demand (`POST /tokens/rotate`,
+  full token only): both values are replaced at once, the old ones
+  die immediately, and the new values are returned exactly once so
+  the client can rewrite its files. Token values are never written
+  to any log.
 - **Bind scope.** 127.0.0.1 and the Tailscale address only. Never
   0.0.0.0, never the LAN, never the public internet.
-- **Exec timeouts are mandatory.** Default 30 s, hard cap 120 s; a
-  runaway command's whole process group is killed, not left loose.
+- **Exec denylist (v1.1, #12).** Natalie's hard lines are refused
+  in code unless the request explicitly confirms them: recursive
+  `rm` of `/`, `/home`, `~` or system directories; `mkfs`; `dd`
+  onto a raw disk device; `shutdown` / `reboot` / `poweroff` /
+  `halt` (including via `systemctl`); fork bombs. A refusal names
+  the rule it hit.
+- **The hands lock (v1.1, #12).** `POST /lock` freezes every hands
+  verb and exec behind `{"ok": false, "error": "locked"}` until
+  `POST /unlock`. Looking still works while locked, and the lock
+  survives a daemon restart -- it is a state Natalie (or Muse, on
+  her word) sets, not a session flag.
+- **Audit log (v1.1, #16).** Every call appends one line to
+  `~/meta-linux-controller/audit.log`: time, verb, which token
+  scope was used, a short summary (for exec, the command truncated
+  to 200 characters), and the result -- refusals included. Command
+  *outputs* are never stored, only a truncated SHA-256 of them.
+  Token values never appear. The log rotates at ~5 MB, keeping one
+  old file. (The systemd journal stays quiet as before; the audit
+  log is the deliberate, local record.)
 - **No credential storage.** The daemon never stores credentials of
-  Natalie's. Its own token is the only secret it holds.
-- **Quiet logs.** The daemon logs method, path, and status only --
-  never the token, never headers, never request bodies (typed text
-  and commands are not written to the log).
+  Natalie's. Its own tokens are the only secrets it holds.

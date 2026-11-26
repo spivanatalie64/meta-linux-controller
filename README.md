@@ -10,14 +10,14 @@ It is the PC counterpart of the adapter on my phone: same idea, same rules. Eyes
 
 ## How it works
 
-- A daemon runs in my graphical session on the PC (Cinnamon/X11) and owns the display connection.
-- Eyes: screenshots, the AT-SPI accessibility tree (the UI as text), and the window list.
-- Hands: click, type, key presses, scroll, app launch and focus -- plus a shell endpoint, because SSH proved the pattern and this makes it one surface.
-- Every call needs the token. The daemon binds to loopback and my tailnet address only -- never the public internet.
+- A headless-first daemon runs on the PC (X11, dwm on XLibre): it serves status, shell and the chat queue with no display attached, and its eyes and hands attach when the desktop logs in. One step -- systemd linger, in `enable-boot.sh` -- makes it start at boot.
+- Eyes: screenshots (whole screen or one window), the AT-SPI accessibility tree (the UI as text), the window list, and Live eyes: a real-time video watch layer over the X server with a rolling recorder (#17).
+- Hands: click, type (including verified type-into-this-window), key presses, scroll, app launch and focus -- plus a shell endpoint, because SSH proved the pattern and this makes it one surface.
+- Every call needs a token -- a read token to look, a full token to act. The daemon binds to loopback and my tailnet address only -- never the public internet. Every call lands in an audit log; an exec denylist and a hands lock are enforced in the code, not just written here.
 
 ## Status
 
-v1 in progress. The work is filed as issues, assigned, and gathered in the v1 milestone. Apache License 2.0, matching my other repos.
+v1.1 built (service + hardening, #10-#16) on top of v1 (#1-#9), with Live eyes (#17) alongside. The work is filed as issues, assigned, and gathered in milestones. Apache License 2.0, matching my other repos.
 
 ## Rules it runs under
 

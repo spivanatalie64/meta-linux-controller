@@ -2,9 +2,12 @@
 """muse-chat -- talk to Muse from a terminal on Natalie's PC.
 
 Single-file, standard library only. Talks to the Meta Linux Controller
-daemon on loopback (http://127.0.0.1:8771) with the token from
-token.txt next to the daemon. Type a line, it is queued for Muse;
-Muse's replies print here as they land, prefixed "Muse:".
+daemon on loopback (http://127.0.0.1:8771). Sending uses the full
+token (token.txt next to the daemon); reading uses the read token
+(read-token.txt), so this console never marks her own lines seen --
+only Muse's full-token inbox polls do that (v1.1, #15). When Muse
+has seen one of her lines, a tick says so here. The header shows how
+long ago Muse last checked the inbox.
 
 Ctrl-C or Ctrl-D exits.
 """
@@ -19,32 +22,54 @@ import urllib.error
 
 BASE = os.environ.get("MLC_BASE", "http://127.0.0.1:8771")
 HERE = os.path.dirname(os.path.abspath(__file__))
-TOKEN_FILE = os.environ.get(
-    "MLC_TOKEN_FILE", os.path.join(HERE, "token.txt")
-)
+FULL_FILE = os.environ.get(
+    "MLC_TOKEN_FILE", os.path.join(HERE, "token.txt"))
+READ_FILE = os.environ.get(
+    "MLC_READ_TOKEN_FILE", os.path.join(HERE, "read-token.txt"))
 POLL_S = 2.0
 
 
-def load_token():
-    with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-        return f.read().strip()
+def _load(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return None
 
 
-TOKEN = load_token()
+TOKEN_FULL = _load(FULL_FILE)
+TOKEN_READ = _load(READ_FILE) or TOKEN_FULL
 
 
-def call(method, path, body=None):
+def call(method, path, body=None, scope="read"):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         BASE + path, data=data, method=method,
-        headers={"X-Token": TOKEN, "Content-Type": "application/json"},
+        headers={"X-Token": TOKEN_FULL if scope == "full"
+                 else TOKEN_READ,
+                 "Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.loads(resp.read().decode())
 
 
+def heartbeat_text():
+    try:
+        st = call("GET", "/status")
+        ago = st.get("chat_last_full_inbox_poll_s_ago")
+    except Exception:
+        return None
+    if ago is None:
+        return "Muse has not checked the inbox yet."
+    if ago < 90:
+        return "Muse last checked %ds ago." % int(ago)
+    return "Muse last checked %dm ago." % int(ago // 60)
+
+
 stop = threading.Event()
 cursor = [0]
+sent_ids = set()
+inbox_seen = {}
 
 
 def poller():
@@ -53,7 +78,25 @@ def poller():
             res = call("GET", f"/chat/outbox?after={cursor[0]}")
             for msg in res.get("messages", []):
                 cursor[0] = max(cursor[0], msg["id"])
-                print(f"\nClaude: {msg['text']}\n> ", end="", flush=True)
+                print(f"\nClaude: {msg['text']}\n> ", end="",
+                      flush=True)
+        except Exception:
+            pass
+        try:
+            res = call("GET", "/chat/inbox")
+            for msg in res.get("messages", []):
+                mid = msg["id"]
+                seen = bool(msg.get("seen"))
+                if mid not in inbox_seen:
+                    inbox_seen[mid] = seen
+                    if mid not in sent_ids:
+                        tick = " ✓" if seen else ""
+                        print(f"\nYou: {msg['text']}{tick}\n> ",
+                              end="", flush=True)
+                elif seen and not inbox_seen[mid]:
+                    inbox_seen[mid] = True
+                    print(f"\n[✓ Muse saw: \"{msg['text'][:40]}\"]"
+                          f"\n> ", end="", flush=True)
         except Exception:
             pass
         stop.wait(POLL_S)
@@ -64,12 +107,19 @@ def main():
         res = call("GET", "/chat/outbox")
         for msg in res.get("messages", []):
             cursor[0] = max(cursor[0], msg["id"])
+        res = call("GET", "/chat/inbox")
+        for msg in res.get("messages", []):
+            inbox_seen[msg["id"]] = bool(msg.get("seen"))
     except Exception as e:
-        print(f"muse-chat: cannot reach the controller daemon at {BASE} ({e})")
+        print(f"muse-chat: cannot reach the controller daemon at "
+              f"{BASE} ({e})")
         print("Is meta-linux-controller.service running?")
         return 1
     print("muse-chat -- talk to Muse. Type a line and press Enter.")
     print("Replies print here as they land. Ctrl-C to exit.")
+    hb = heartbeat_text()
+    if hb:
+        print(hb)
     t = threading.Thread(target=poller, daemon=True)
     t.start()
     try:
@@ -82,7 +132,10 @@ def main():
             if not line:
                 continue
             try:
-                call("POST", "/chat/send", {"text": line})
+                res = call("POST", "/chat/send", {"text": line},
+                           scope="full")
+                sent_ids.add(res["message"]["id"])
+                inbox_seen[res["message"]["id"]] = False
             except Exception as e:
                 print(f"(could not send: {e})")
     except KeyboardInterrupt:

@@ -1,3 +1,16 @@
+# Meta Linux Controller -- systemd --user unit (the installed one).
+#
+# The daemon is headless-first: it serves status, exec and the chat
+# queue with no display attached, and its eyes/hands attach when the
+# graphical session's display appears. The DISPLAY/XAUTHORITY values
+# below name the session display it should attach to; they are a
+# target, not a requirement -- if the X socket is absent the daemon
+# simply runs headless until it shows up.
+#
+# Boot persistence: a --user service starts at boot only with
+# systemd linger on. That one step needs Natalie's sudo -- see
+# enable-boot.sh. A system-unit variant (not installed) is in
+# systemd/meta-linux-controller-system.service.
 [Unit]
 Description=Meta Linux Controller -- Muse control daemon for Natalie's PC
 After=graphical-session.target

@@ -1,12 +1,19 @@
 #!/usr/bin/env python3
 """Meta Linux Controller client -- runs on the Muse VM.
 
-Wraps the daemon's verbs. Reads the token from
-~/workspace/tools/meta-linux-controller-token.txt (mode 600; override
-with MLC_TOKEN_FILE). Talks to the local end of the SSH port-forward
-to Natalie's PC; if that port is not answering, it starts the forward
-first (ssh -F ~/workspace/tools/sshcfg-pc-ts -N -L 8771:127.0.0.1:8771
-natalie-pc-ts). Override the base URL with MLC_BASE.
+Wraps the daemon's verbs. Two token scopes (v1.1, #11): the FULL
+token in ~/workspace/tools/meta-linux-controller-token.txt (mode
+600; override with MLC_TOKEN_FILE) can act; the READ token in
+~/workspace/tools/meta-linux-controller-read-token.txt can only
+look. Read-scope verbs automatically present the read token.
+
+Two transports (#13): the SSH port-forward to Natalie's PC
+(ssh -F ~/workspace/tools/sshcfg-pc-ts -N -L 8771:127.0.0.1:8771
+natalie-pc-ts, started on demand), and -- if the forward path
+fails -- an SSH-exec'd curl on the PC's own loopback, where the
+token is read on the PC and never leaves it. A call that fails on
+one road is retried once on the other. Override the base URL with
+MLC_BASE.
 
 Usage:
   meta_linux_controller.py ping
@@ -29,6 +36,10 @@ Usage:
   meta_linux_controller.py watch [--seconds N] [--out DIR]
                                  [--window ID] [--scale F] [--fps N]
                                  [--record] [--interval S] [--keep-open]
+  meta_linux_controller.py type-in-window WINDOW_ID TEXT [--enter]
+  meta_linux_controller.py lock | unlock
+  meta_linux_controller.py audit [--limit N]
+  meta_linux_controller.py rotate
 """
 
 import argparse
@@ -46,13 +57,49 @@ TOKEN_FILE = os.environ.get(
     "MLC_TOKEN_FILE",
     os.path.expanduser("~/workspace/tools/meta-linux-controller-token.txt"),
 )
+READ_TOKEN_FILE = os.environ.get(
+    "MLC_READ_TOKEN_FILE",
+    os.path.expanduser(
+        "~/workspace/tools/meta-linux-controller-read-token.txt"),
+)
 SSH_CONFIG = os.path.expanduser("~/workspace/tools/sshcfg-pc-ts")
 TUNNEL_LOG = "/tmp/mlc-tunnel.log"
+LAST_TRANSPORT = None
+
+_READ_CALLS = {
+    ("GET", "/ping"), ("GET", "/status"), ("GET", "/windows"),
+    ("GET", "/chat/inbox"), ("GET", "/chat/outbox"),
+    ("GET", "/audit"), ("GET", "/watch/frame"),
+    ("GET", "/watch/stream"), ("GET", "/screenshot"),
+    ("GET", "/tree"), ("POST", "/screenshot"), ("POST", "/tree"),
+}
 
 
-def token():
-    with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-        return f.read().strip()
+def scope_for(method, path):
+    return "read" if (method, path.split("?")[0]) in _READ_CALLS \
+        else "full"
+
+
+def token(scope="full"):
+    path = READ_TOKEN_FILE if scope == "read" else TOKEN_FILE
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        if scope == "read":
+            return token("full")
+        raise
+
+
+class TransportFail(Exception):
+    pass
+
+
+class DaemonRefusal(Exception):
+    def __init__(self, status, obj):
+        super().__init__(status)
+        self.status = status
+        self.obj = obj
 
 
 def port_answers():
@@ -85,27 +132,103 @@ def ensure_tunnel():
     raise SystemExit(f"tunnel did not come up; see {TUNNEL_LOG}")
 
 
-def call(method, path, body=None, raw=False):
-    ensure_tunnel()
+def _forward_call(method, path, body, raw, scope):
+    try:
+        ensure_tunnel()
+    except SystemExit as e:
+        raise TransportFail(str(e))
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(
         BASE + path, data=data, method=method,
-        headers={"X-Token": token(), "Content-Type": "application/json"},
+        headers={"X-Token": token(scope),
+                 "Content-Type": "application/json"},
     )
     try:
         with urllib.request.urlopen(req, timeout=90) as resp:
-            payload = resp.read()
+            return resp.read()
     except urllib.error.HTTPError as e:
         payload = e.read()
         try:
             obj = json.loads(payload.decode())
         except Exception:
-            obj = {"ok": False, "error": payload.decode(errors="replace")[:300]}
-        print(json.dumps(obj, indent=2))
-        raise SystemExit(f"HTTP {e.code}")
+            obj = {"ok": False,
+                   "error": payload.decode(errors="replace")[:300]}
+        raise DaemonRefusal(e.code, obj)
+    except (urllib.error.URLError, TimeoutError, OSError) as e:
+        raise TransportFail(str(e))
+
+
+def _ssh_call(method, path, body, raw, scope):
+    """Second road (#13): curl on the PC's loopback over SSH. The
+    token is read from the PC's own token file and never leaves
+    the PC; only the response comes back."""
+    import base64
+    import shlex
+    tokfile = "read-token.txt" if scope == "read" else "token.txt"
+    url = "http://127.0.0.1:8771" + path
+    remote = (
+        "curl -s -X {m} "
+        "-H \"X-Token: $(cat ~/meta-linux-controller/{tf})\" "
+        "-H \"Content-Type: application/json\" "
+        "{data} {url} -w \"\\n__MLC_HTTP__%{{http_code}}\""
+    ).format(m=method, tf=tokfile,
+             data="--data-binary @-" if body is not None else "",
+             url=shlex.quote(url))
     if raw:
-        return payload
-    return json.loads(payload.decode())
+        remote += " | base64 -w0"
+    data = json.dumps(body).encode() if body is not None else b""
+    try:
+        r = subprocess.run(
+            ["ssh", "-F", SSH_CONFIG, "-o", "BatchMode=yes",
+             "natalie-pc-ts", remote],
+            input=data, capture_output=True, timeout=90)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        raise TransportFail(str(e))
+    out = r.stdout.decode(errors="replace")
+    marker = "\n__MLC_HTTP__"
+    if r.returncode != 0 or marker not in out:
+        raise TransportFail("ssh transport failed: %s"
+                            % (r.stderr.decode(errors="replace")[:200]))
+    payload_s, _, status_s = out.rpartition(marker)
+    status = int(status_s.strip())
+    if raw:
+        payload = base64.b64decode(payload_s.strip() or "")
+    else:
+        payload = payload_s.encode()
+    if status >= 400:
+        try:
+            obj = json.loads(payload.decode())
+        except Exception:
+            obj = {"ok": False,
+                   "error": payload.decode(errors="replace")[:300]}
+        raise DaemonRefusal(status, obj)
+    return payload
+
+
+def call(method, path, body=None, raw=False):
+    """One call, two roads: forward first, SSH-exec as the retry.
+    A daemon refusal (4xx/5xx with a JSON body) is an answer, not a
+    transport failure -- it is printed, never retried."""
+    global LAST_TRANSPORT
+    scope = scope_for(method, path)
+    roads = [("forward", _forward_call), ("ssh", _ssh_call)]
+    if LAST_TRANSPORT == "ssh":
+        roads.reverse()
+    last_err = None
+    for name, road in roads:
+        try:
+            payload = road(method, path, body, raw, scope)
+            LAST_TRANSPORT = name
+            if raw:
+                return payload
+            return json.loads(payload.decode())
+        except TransportFail as e:
+            last_err = e
+            continue
+        except DaemonRefusal as e:
+            print(json.dumps(e.obj, indent=2))
+            raise SystemExit(f"HTTP {e.status}")
+    raise SystemExit(f"both transports failed: {last_err}")
 
 
 def main():
@@ -165,23 +288,33 @@ def main():
     cs.add_argument("text")
     cr = sub.add_parser("chat-reply")
     cr.add_argument("text")
+    tw = sub.add_parser("type-in-window")
+    tw.add_argument("window_id")
+    tw.add_argument("text")
+    tw.add_argument("--enter", action="store_true")
+    sub.add_parser("lock")
+    sub.add_parser("unlock")
+    au = sub.add_parser("audit")
+    au.add_argument("--limit", type=int, default=50)
+    sub.add_parser("rotate")
     args = ap.parse_args()
 
     if args.cmd == "ping":
         print(json.dumps(call("GET", "/ping"), indent=2))
     elif args.cmd == "status":
         print(json.dumps(call("GET", "/status"), indent=2))
+        print(json.dumps({"transport": LAST_TRANSPORT}))
     elif args.cmd == "windows":
         print(json.dumps(call("GET", "/windows"), indent=2))
     elif args.cmd == "tree":
-        res = call("GET", "/tree")
-        print("focused window:", res.get("focused_window"))
+        res = call("POST", "/tree", {})
+        text = json.dumps(res, indent=2)
         if args.out:
             with open(args.out, "w", encoding="utf-8") as f:
-                f.write(res.get("tree", ""))
+                f.write(text)
             print(f"tree written to {args.out}")
         else:
-            print(res.get("tree", ""))
+            print(text)
     elif args.cmd == "screenshot":
         data = call("POST", "/screenshot", body={}, raw=True)
         with open(args.file, "wb") as f:
@@ -208,9 +341,10 @@ def main():
         sys.stdout.write(res.get("stdout", ""))
         if res.get("stderr"):
             sys.stderr.write(res["stderr"])
-        print(f"[exit_code={res.get('exit_code')} timed_out={res.get('timed_out')}]",
+        timed_out = res.get("error") == "timeout"
+        print(f"[exit_code={res.get('returncode')} timed_out={timed_out}]",
               file=sys.stderr)
-        return res.get("exit_code") or 0
+        return res.get("returncode") or 0
     elif args.cmd == "watch-open":
         body = {"scale": args.scale, "fps": args.fps,
                 "record": args.record, "idle_timeout_s": args.idle_timeout}
@@ -240,7 +374,8 @@ def main():
         os.makedirs(args.out, exist_ok=True)
         ensure_tunnel()
         req = urllib.request.Request(
-            BASE + "/watch/stream", headers={"X-Token": token()})
+            BASE + "/watch/stream",
+            headers={"X-Token": token("read")})
         resp = urllib.request.urlopen(req, timeout=args.seconds + 30)
         buf = bytearray()
         saved = 0
@@ -278,13 +413,41 @@ def main():
         if opened and not args.keep_open:
             print(json.dumps(call("POST", "/watch/close", {})))
     elif args.cmd == "chat-inbox":
-        print(json.dumps(call("GET", f"/chat/inbox?after={args.after}"), indent=2))
+        res = call("GET", "/chat/inbox")
+        if args.after:
+            res["messages"] = [m for m in res.get("messages", [])
+                               if m["id"] > args.after]
+        print(json.dumps(res, indent=2))
     elif args.cmd == "chat-outbox":
         print(json.dumps(call("GET", f"/chat/outbox?after={args.after}"), indent=2))
     elif args.cmd == "chat-send":
         print(json.dumps(call("POST", "/chat/send", {"text": args.text})))
     elif args.cmd == "chat-reply":
         print(json.dumps(call("POST", "/chat/reply", {"text": args.text})))
+    elif args.cmd == "type-in-window":
+        print(json.dumps(call("POST", "/type_in_window",
+                              {"window_id": args.window_id,
+                               "text": args.text,
+                               "press_enter": args.enter})))
+    elif args.cmd == "lock":
+        print(json.dumps(call("POST", "/lock", {})))
+    elif args.cmd == "unlock":
+        print(json.dumps(call("POST", "/unlock", {})))
+    elif args.cmd == "audit":
+        print(json.dumps(call("GET", f"/audit?limit={args.limit}"),
+                         indent=2))
+    elif args.cmd == "rotate":
+        res = call("POST", "/tokens/rotate", {})
+        for dest, value in ((TOKEN_FILE, res["full_token"]),
+                            (READ_TOKEN_FILE, res["read_token"])):
+            tmp = dest + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(value + "\n")
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, dest)
+        print(json.dumps({"ok": True, "rotated": True,
+                          "note": "new token values written to the "
+                                  "local token files (not printed)"}))
     return 0
 
 

@@ -80,6 +80,10 @@ All endpoints require the token. JSON in/out, except `/screenshot`
 | watch record | `POST /watch/record` | `{on}` -- toggle the rolling recording on the live capture |
 | watch frame | `GET /watch/frame` | the latest frame as a JPEG |
 | watch stream | `GET /watch/stream` | MJPEG multipart stream of frames as they are captured |
+| type in window | `POST /type_in_window` | `{window_id, text, press_enter?}` -- focus by id, verify, type (#14) |
+| lock / unlock | `POST /lock`, `POST /unlock` | freeze the hands + exec until unlocked (#12) |
+| rotate tokens | `POST /tokens/rotate` | replace both tokens; new values returned once (#11) |
+| audit | `GET /audit?limit=N` | recent audit-log entries (#16) |
 
 Focus matches by plain substring over **all** windows, enumerated in
 the daemon: xdotool's own search is POSIX-regex (escapes bite), and on
@@ -180,6 +184,58 @@ land, the way a page change is seen in the browser.
   polling `/watch/frame` after sending Enter to a terminal: ~1.2 s,
   dominated by the per-request frame-fetch cadence; the stream
   itself delivers continuously at the session frame rate.
+
+## v1.1 -- service and hardening (#10-#16)
+
+- **Headless-first (#10).** The daemon no longer presumes a
+  display. A watcher thread probes the X socket for its `$DISPLAY`
+  target every 3 s. With no display: `/status`, `/exec` and the chat
+  queue answer normally; eyes/hands return
+  `{"ok": false, "error": "no_display"}` (HTTP 503). When the socket
+  appears the daemon attaches; when it vanishes it detaches. The
+  systemd --user unit stays as installed; `enable-boot.sh` is the
+  one shipped step that needs Natalie's sudo (`loginctl
+  enable-linger natalie`) to make the user service start at boot. A
+  system-unit variant ships in the repo marked *not installed*.
+- **Token scopes (#11).** `token.txt` (full) and `read-token.txt`
+  (read), both mode 600 on the PC; the VM client mirrors the pair.
+  Read covers status, screenshot, tree, windows, chat GETs, audit
+  GET, and the watch frame/stream; full covers everything. Wrong
+  scope: 403 `insufficient_scope` naming the needed scope.
+  `POST /tokens/rotate` (full only) replaces both at once -- old
+  values fail immediately -- and returns the new pair exactly once.
+- **Guardrails (#12).** The exec denylist lives in one commented
+  block in the daemon (Natalie's hard lines; see `docs/safety.md`)
+  and refuses with `confirmation_required` + the rule name unless
+  the request carries `"confirm": true`. The lock (`/lock`,
+  `/unlock`, full scope) freezes hands + exec behind
+  `{"ok": false, "error": "locked"}` and persists in `lock.json`
+  across restarts; `/status` reports it.
+- **Transport failover (#13, client-side).** The VM client tries
+  the SSH port-forward first, then an SSH-exec'd curl on the PC's
+  loopback (token read on the PC, never in transit on the VM side).
+  `status` prints which transport answered. A daemon refusal is an
+  answer and is never retried on the other road.
+- **Window eyes + atomic typing (#14).** `/screenshot` takes a
+  `window` id (`import -window <id>`). `/type_in_window` focuses by
+  id, polls until the focused id matches (mismatch is a clean 409,
+  never a silent wrong-window type -- v1's focus bug made this a
+  hard requirement), then types.
+- **Chat receipts (#15).** Inbox messages carry `seen`. Only a
+  full-token `GET /chat/inbox` marks them (that is Muse reading;
+  the VM watcher hook polls exactly that way, reading the PC's
+  token file each cycle, so rotation does not break it). Read-token
+  fetches never mark. `/status` reports
+  `chat_last_full_inbox_poll_s_ago`; muse-chat polls with the read
+  token, ticks her seen lines with a ✓, and shows the heartbeat in
+  its header. The inbox response shape is v1's plus the `seen`
+  field -- nothing removed, nothing renamed.
+- **Audit log (#16).** Append-only JSONL at
+  `~/meta-linux-controller/audit.log`: `{ts, verb, scope, summary,
+  result}` per call, exec outputs hashed (SHA-256, first 12) and
+  never stored, refusals (401/403/denylist/locked/no_display)
+  logged like everything else, rotation at ~5 MB keeping one old
+  file, `GET /audit?limit=N` to read it back.
 
 ## Client shape
 
