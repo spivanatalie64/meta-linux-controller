@@ -919,7 +919,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         status, payload, ctype, summary, result = out
         out_text = None
-        if path == "/exec" and isinstance(payload, dict):
+        if path == "/exec" and isinstance(payload, dict) \
+                and "returncode" in payload:
+            # Only a call that actually executed has output to hash;
+            # refusals carry no out_sha256.
             out_text = (payload.get("stdout") or "") + \
                 (payload.get("stderr") or "")
         self._send(status, payload, ctype)
