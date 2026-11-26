@@ -30,7 +30,7 @@ import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 STARTED = time.time()
 HERE = os.path.dirname(os.path.abspath(__file__))
 TOKEN_FILE = os.environ.get("MLC_TOKEN_FILE", os.path.join(HERE, "token.txt"))
@@ -49,6 +49,18 @@ def load_token():
 
 
 TOKEN = load_token()
+
+# ------------------------------------------------------------ watch (#17)
+# Live X11 capture (MJPEG stream + latest frame + rolling recording),
+# implemented in mlc_watch.py next to this file. Optional: if the
+# module is missing the daemon still runs and /watch/* says so.
+try:
+    import mlc_watch as _mlc_watch
+
+    WATCH = _mlc_watch.WatchManager(HERE, os.environ)
+except Exception as _watch_err:  # pragma: no cover
+    WATCH = None
+    sys.stderr.write(f"mlc: watch layer unavailable: {_watch_err}\n")
 
 
 def tailnet_ip():
@@ -397,6 +409,50 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_jpeg(self, data):
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _watch_stream(self):
+        """GET /watch/stream -- multipart/x-mixed-replace MJPEG."""
+        if WATCH is None:
+            self._send_json({"ok": False, "error": "watch_unavailable"}, 501)
+            return
+        try:
+            session = WATCH.stream_open()
+        except Exception as e:
+            self._send_json({"ok": False, "error": str(e)}, 409)
+            return
+        try:
+            self.send_response(200)
+            self.send_header(
+                "Content-Type",
+                "multipart/x-mixed-replace; boundary=mlcframe",
+            )
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.close_connection = True
+            seq = 0
+            while True:
+                latest = WATCH.wait_frame(seq, timeout=20)
+                if latest is None:
+                    break
+                frame, seq, _ts = latest
+                part = (
+                    b"--mlcframe\r\nContent-Type: image/jpeg\r\n"
+                    + f"Content-Length: {len(frame)}\r\n\r\n".encode()
+                    + frame + b"\r\n"
+                )
+                self.wfile.write(part)
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            WATCH.stream_close(session)
+
     def _body(self):
         length = int(self.headers.get("Content-Length") or 0)
         if length <= 0:
@@ -412,6 +468,9 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json({"ok": False, "error": "unauthorized"}, 401)
             return
         path, _, query = self.path.partition("?")
+        if method == "GET" and path == "/watch/stream":
+            self._watch_stream()
+            return
         params = urllib.parse.parse_qs(query)
         try:
             after = int(params.get("after", ["0"])[0])
@@ -436,6 +495,8 @@ class Handler(BaseHTTPRequestHandler):
                     "token_present": bool(TOKEN),
                     "uptime_s": round(time.time() - STARTED, 1),
                     "pid": os.getpid(),
+                    "watch": (WATCH.status() if WATCH is not None
+                              else {"available": False}),
                 })
             elif method == "POST" and path == "/screenshot":
                 self._send_png(do_screenshot())
@@ -487,6 +548,43 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_json(
                     {"ok": True, "messages": _chat_read(CHAT_OUTBOX, after)}
                 )
+            elif method == "POST" and path == "/watch/open":
+                if WATCH is None:
+                    self._send_json(
+                        {"ok": False, "error": "watch_unavailable"}, 501)
+                else:
+                    b = self._body()
+                    info = WATCH.open_session(
+                        window_id=b.get("window"),
+                        scale=b.get("scale", 0.5),
+                        fps=b.get("fps", 10),
+                        record=bool(b.get("record", False)),
+                        idle_timeout_s=b.get("idle_timeout_s", 120),
+                    )
+                    self._send_json({"ok": True, **info})
+            elif method == "POST" and path == "/watch/close":
+                if WATCH is None:
+                    self._send_json(
+                        {"ok": False, "error": "watch_unavailable"}, 501)
+                else:
+                    self._send_json(WATCH.close_session())
+            elif method == "POST" and path == "/watch/record":
+                if WATCH is None:
+                    self._send_json(
+                        {"ok": False, "error": "watch_unavailable"}, 501)
+                else:
+                    b = self._body()
+                    self._send_json(WATCH.set_record(bool(b.get("on", False))))
+            elif method == "GET" and path == "/watch/frame":
+                if WATCH is None:
+                    self._send_json(
+                        {"ok": False, "error": "watch_unavailable"}, 501)
+                else:
+                    try:
+                        frame, seq, ts = WATCH.get_frame()
+                        self._send_jpeg(frame)
+                    except Exception as e:
+                        self._send_json({"ok": False, "error": str(e)}, 409)
             else:
                 self._send_json({"ok": False, "error": "no such endpoint"}, 404)
         except subprocess.TimeoutExpired:

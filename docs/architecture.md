@@ -1,6 +1,7 @@
 # Meta Linux Controller -- architecture
 
-v1, decided and built 2026-11-25. This document records the decisions;
+v1, decided and built 2026-11-25; the watch layer (#17) added the
+same day on the v1.1 branch. This document records the decisions;
 the code is `daemon/meta_linux_controllerd.py`.
 
 ## What it is
@@ -74,6 +75,11 @@ All endpoints require the token. JSON in/out, except `/screenshot`
 | chat inbox | `GET /chat/inbox` | Muse reads her lines (`?after=<id>` cursor) |
 | chat reply | `POST /chat/reply` | `{text}` -- Muse's answer, queued for her console |
 | chat outbox | `GET /chat/outbox` | her console polls for replies (`?after=<id>` cursor) |
+| watch open | `POST /watch/open` | `{window?, scale, fps, record, idle_timeout_s}` -- start a watch session (#17) |
+| watch close | `POST /watch/close` | end the session; the open recording segment is finalized |
+| watch record | `POST /watch/record` | `{on}` -- toggle the rolling recording on the live capture |
+| watch frame | `GET /watch/frame` | the latest frame as a JPEG |
+| watch stream | `GET /watch/stream` | MJPEG multipart stream of frames as they are captured |
 
 Focus matches by plain substring over **all** windows, enumerated in
 the daemon: xdotool's own search is POSIX-regex (escapes bite), and on
@@ -122,6 +128,58 @@ tailnet path above.
   (`client/meta_linux_controller.py`, installed on the VM at
   `~/workspace/tools/meta_linux_controller.py`) starts this forward
   automatically when the local port is not answering.
+
+## Live eyes -- the watch layer (#17)
+
+Natalie's design: "a layer over the XServer with a video recorder so
+you can watch in real time. Think like how you do with chrome." The
+controller's stills (one `import` per call) stay as the lightweight
+fallback; the watch layer is for *watching* -- seeing a hands action
+land, the way a page change is seen in the browser.
+
+- **Component:** `watch/mlc_watch.py`, imported by the daemon (the
+  daemon runs fine without it; `/watch/*` then says
+  `watch_unavailable`). One active session at a time.
+- **Capture:** one ffmpeg `x11grab` process per session (XCB capture,
+  MIT-SHM on this X server), full root window or one window
+  (`-window_id`). Session parameters: `scale` (default 0.5 -- the
+  desktop is 3840x1080 across two monitors, so the default feed is
+  1920x540) and `fps` (default 10). The root size comes from
+  `xrandr`'s current size: `xdotool getdisplaygeometry` reports only
+  one screen (1920x1080) on this dual-monitor XLibre setup.
+- **Frames out:** ffmpeg encodes MJPEG to stdout; a reader thread in
+  the manager splits frames and keeps the latest. `/watch/frame`
+  serves that JPEG; `/watch/stream` serves the same frames as a
+  multipart MJPEG stream. Token auth and bind scope are the
+  controller's, unchanged.
+- **Recorder:** with `record` on, the same ffmpeg writes a second
+  output: fragmented-MP4 segments (`-segment_time 60`) under
+  `~/meta-linux-controller/watch/recordings/`, pruned to the last 30
+  minutes by a janitor thread. Fragmented MP4 matters: a plain MP4
+  segment that is still open when a session ends loses its moov and
+  the whole segment. Just as load-bearing: on close, ffmpeg is
+  signalled *while its stdout reader is still draining* -- stopping
+  the drain first wedges ffmpeg on the full pipe and even SIGKILL
+  then leaves an unplayable segment (both failure modes were hit and
+  fixed during the build; a closed 8-second session now leaves a
+  valid 8.6-second segment).
+- **Guardrails:** capture runs only while a session is open. A
+  session with no stream consumers and no frame pulls auto-stops
+  after its idle timeout (default 120 s; the reason is kept in
+  `/status` as `watch.last_stop`). Recording that was explicitly
+  switched on counts as a standing instruction and is exempt from
+  idle auto-stop. Nothing records when no session is open and record
+  mode was not explicitly enabled.
+- **Client:** `watch-open / watch-close / watch-record /
+  watch-frame`, and `watch`, which opens a session if needed, pulls
+  the stream, saves frames to a directory, and closes what it opened.
+- **Measured on her machine** (i5-10210U, 8 threads), default
+  settings (10 fps, half scale): the capture ffmpeg uses ~25% of one
+  core with recording off, ~43% with it on (~3% / ~5% of the whole
+  machine). Action-to-visible latency, measured from the VM by
+  polling `/watch/frame` after sending Enter to a terminal: ~1.2 s,
+  dominated by the per-request frame-fetch cadence; the stream
+  itself delivers continuously at the session frame rate.
 
 ## Client shape
 

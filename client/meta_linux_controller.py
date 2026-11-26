@@ -21,6 +21,14 @@ Usage:
   meta_linux_controller.py launch COMMAND...
   meta_linux_controller.py focus TITLE
   meta_linux_controller.py exec [--timeout N] COMMAND...
+  meta_linux_controller.py watch-open [--window ID] [--scale F]
+                                      [--fps N] [--record]
+  meta_linux_controller.py watch-close
+  meta_linux_controller.py watch-record on|off
+  meta_linux_controller.py watch-frame FILE.jpg
+  meta_linux_controller.py watch [--seconds N] [--out DIR]
+                                 [--window ID] [--scale F] [--fps N]
+                                 [--record] [--interval S] [--keep-open]
 """
 
 import argparse
@@ -129,6 +137,26 @@ def main():
     ex = sub.add_parser("exec")
     ex.add_argument("--timeout", type=int, default=30)
     ex.add_argument("command", nargs="+")
+    wo = sub.add_parser("watch-open")
+    wo.add_argument("--window")
+    wo.add_argument("--scale", type=float, default=0.5)
+    wo.add_argument("--fps", type=int, default=10)
+    wo.add_argument("--record", action="store_true")
+    wo.add_argument("--idle-timeout", type=int, default=120)
+    sub.add_parser("watch-close")
+    wr = sub.add_parser("watch-record")
+    wr.add_argument("onoff", choices=["on", "off"])
+    wf = sub.add_parser("watch-frame")
+    wf.add_argument("file")
+    wa = sub.add_parser("watch")
+    wa.add_argument("--seconds", type=float, default=10)
+    wa.add_argument("--out", default="/tmp/mlc-watch-frames")
+    wa.add_argument("--window")
+    wa.add_argument("--scale", type=float, default=0.5)
+    wa.add_argument("--fps", type=int, default=10)
+    wa.add_argument("--record", action="store_true")
+    wa.add_argument("--interval", type=float, default=0.25)
+    wa.add_argument("--keep-open", action="store_true")
     ci = sub.add_parser("chat-inbox")
     ci.add_argument("--after", type=int, default=0)
     co = sub.add_parser("chat-outbox")
@@ -183,6 +211,72 @@ def main():
         print(f"[exit_code={res.get('exit_code')} timed_out={res.get('timed_out')}]",
               file=sys.stderr)
         return res.get("exit_code") or 0
+    elif args.cmd == "watch-open":
+        body = {"scale": args.scale, "fps": args.fps,
+                "record": args.record, "idle_timeout_s": args.idle_timeout}
+        if args.window:
+            body["window"] = args.window
+        print(json.dumps(call("POST", "/watch/open", body), indent=2))
+    elif args.cmd == "watch-close":
+        print(json.dumps(call("POST", "/watch/close", {})))
+    elif args.cmd == "watch-record":
+        print(json.dumps(call("POST", "/watch/record",
+                              {"on": args.onoff == "on"})))
+    elif args.cmd == "watch-frame":
+        data = call("GET", "/watch/frame", raw=True)
+        with open(args.file, "wb") as f:
+            f.write(data)
+        print(f"watch frame: {len(data)} bytes -> {args.file}")
+    elif args.cmd == "watch":
+        st = call("GET", "/status")
+        opened = False
+        if not st.get("watch", {}).get("active"):
+            body = {"scale": args.scale, "fps": args.fps,
+                    "record": args.record}
+            if args.window:
+                body["window"] = args.window
+            print(json.dumps(call("POST", "/watch/open", body)))
+            opened = True
+        os.makedirs(args.out, exist_ok=True)
+        ensure_tunnel()
+        req = urllib.request.Request(
+            BASE + "/watch/stream", headers={"X-Token": token()})
+        resp = urllib.request.urlopen(req, timeout=args.seconds + 30)
+        buf = bytearray()
+        saved = 0
+        last_save = 0.0
+        start = time.time()
+        try:
+            while time.time() - start < args.seconds:
+                chunk = resp.read(65536)
+                if not chunk:
+                    break
+                buf += chunk
+                while True:
+                    s = buf.find(b"\xff\xd8")
+                    if s < 0:
+                        buf.clear()
+                        break
+                    e = buf.find(b"\xff\xd9", s + 2)
+                    if e < 0:
+                        if s:
+                            del buf[:s]
+                        break
+                    frame = bytes(buf[s:e + 2])
+                    del buf[:e + 2]
+                    now = time.time()
+                    if now - last_save >= args.interval:
+                        saved += 1
+                        last_save = now
+                        with open(os.path.join(
+                                args.out, f"frame-{saved:04d}.jpg"),
+                                "wb") as f:
+                            f.write(frame)
+        finally:
+            resp.close()
+        print(f"watch: saved {saved} frames to {args.out}")
+        if opened and not args.keep_open:
+            print(json.dumps(call("POST", "/watch/close", {})))
     elif args.cmd == "chat-inbox":
         print(json.dumps(call("GET", f"/chat/inbox?after={args.after}"), indent=2))
     elif args.cmd == "chat-outbox":
